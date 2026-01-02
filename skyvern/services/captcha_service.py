@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import enum
 from datetime import datetime, timedelta
 from typing import Any
@@ -34,6 +35,7 @@ class CaptchaType(str, enum.Enum):
     HCAPTCHA = "hcaptcha"
     TEXT_CAPTCHA = "text"
     IMAGE_CAPTCHA = "image"
+    SLIDER_CAPTCHA = "slider"  # TikTok and similar slider puzzles
 
 
 class CaptchaSolution(BaseModel):
@@ -51,6 +53,7 @@ class CaptchaDetectionResult(BaseModel):
     captcha_type: CaptchaType | None = Field(None, description="Type of CAPTCHA detected")
     site_key: str | None = Field(None, description="Site key for reCAPTCHA/hCaptcha")
     element_id: str | None = Field(None, description="Element ID of the CAPTCHA widget")
+    slider_element: dict | None = Field(None, description="Slider element info for slider CAPTCHAs")
 
 
 async def detect_captcha_from_page(
@@ -99,6 +102,36 @@ async def detect_captcha_from_page(
 
             LOG.info("Detected hCaptcha", site_key=site_key)
             return CaptchaDetectionResult(captcha_type=CaptchaType.HCAPTCHA, site_key=site_key)
+
+        # Check for TikTok/Generic Slider CAPTCHA
+        # TikTok uses captcha-verify-container or secsdk-captcha
+        slider_container = await page.query_selector(".captcha-verify-container, .secsdk-captcha-drag-icon, #captcha_slide_button, [class*='captcha'][class*='slider'], [class*='slide'][class*='captcha']")
+        if slider_container:
+            LOG.info("Detected Slider CAPTCHA (TikTok-style)")
+            
+            # Get slider button info
+            slider_button = await page.query_selector("#captcha_slide_button, .secsdk-captcha-drag-icon, [class*='slider'][class*='button']")
+            slider_info = None
+            if slider_button:
+                box = await slider_button.bounding_box()
+                if box:
+                    slider_info = {
+                        "x": box["x"],
+                        "y": box["y"],
+                        "width": box["width"],
+                        "height": box["height"],
+                    }
+            
+            return CaptchaDetectionResult(
+                captcha_type=CaptchaType.SLIDER_CAPTCHA,
+                slider_element=slider_info
+            )
+
+        # Check for generic puzzle text indicators
+        puzzle_text = await page.query_selector("text=Drag the slider, text=drag the puzzle, text=slide to verify, text=arrastra el control")
+        if puzzle_text:
+            LOG.info("Detected Slider CAPTCHA via text indicator")
+            return CaptchaDetectionResult(captcha_type=CaptchaType.SLIDER_CAPTCHA)
 
         LOG.info("No CAPTCHA detected on page")
         return CaptchaDetectionResult()
@@ -323,6 +356,121 @@ async def submit_hcaptcha(
         )
 
 
+async def capture_slider_screenshot(page: Page) -> str | None:
+    """
+    Capture screenshot of the slider CAPTCHA puzzle area.
+    
+    Returns:
+        Base64 encoded image string, or None if failed
+    """
+    LOG.info("Capturing slider CAPTCHA screenshot")
+    
+    try:
+        # Try to find the puzzle image container
+        # TikTok uses various selectors for the puzzle image
+        puzzle_selectors = [
+            ".captcha-verify-container img",
+            "[class*='captcha'] img",
+            "canvas",
+            "#captcha-verify-image",
+            "[class*='puzzle'] img",
+        ]
+        
+        for selector in puzzle_selectors:
+            element = await page.query_selector(selector)
+            if element:
+                # Take screenshot of the element
+                screenshot_bytes = await element.screenshot()
+                base64_image = base64.b64encode(screenshot_bytes).decode('utf-8')
+                LOG.info("Captured puzzle screenshot", selector=selector, size=len(base64_image))
+                return base64_image
+        
+        # Fallback: capture the entire captcha container
+        container = await page.query_selector(".captcha-verify-container, [class*='captcha'][class*='container']")
+        if container:
+            screenshot_bytes = await container.screenshot()
+            base64_image = base64.b64encode(screenshot_bytes).decode('utf-8')
+            LOG.info("Captured container screenshot", size=len(base64_image))
+            return base64_image
+        
+        # Last resort: capture viewport
+        screenshot_bytes = await page.screenshot()
+        base64_image = base64.b64encode(screenshot_bytes).decode('utf-8')
+        LOG.info("Captured full page screenshot", size=len(base64_image))
+        return base64_image
+        
+    except Exception as e:
+        LOG.error("Error capturing slider screenshot", error=str(e))
+        return None
+
+
+async def submit_slider_captcha(
+    image_base64: str,
+) -> str:
+    """
+    Submit slider/puzzle CAPTCHA to 2Captcha using coordinates method.
+
+    Args:
+        image_base64: Base64 encoded image of the puzzle
+
+    Returns:
+        The captcha_id for polling
+
+    Raises:
+        CaptchaSolvingFailed: If submission fails
+    """
+    LOG.info("Submitting Slider CAPTCHA to 2Captcha (coordinates method)")
+
+    params = {
+        "key": settings.TWOCAPTCHA_API_KEY,
+        "method": "base64",
+        "coordinatescaptcha": 1,
+        "body": image_base64,
+        "textinstructions": "Click on the center of the puzzle piece that needs to be moved",
+        "json": 1,
+    }
+
+    if settings.TWOCAPTCHA_SOFTWARE_KEY:
+        params["soft_id"] = settings.TWOCAPTCHA_SOFTWARE_KEY
+
+    try:
+        status_code, headers, response = await aiohttp_request(
+            "POST", TWOCAPTCHA_IN_URL, data=params
+        )
+
+        if status_code != 200:
+            raise CaptchaSolvingFailed(
+                captcha_type=CaptchaType.SLIDER_CAPTCHA,
+                reason=f"HTTP {status_code}",
+            )
+
+        if isinstance(response, dict):
+            if response.get("status") == 1:  # Success
+                captcha_id = response.get("request")
+                LOG.info("Slider CAPTCHA submitted successfully", captcha_id=captcha_id)
+                return captcha_id
+            else:
+                error_text = response.get("request", "Unknown error")
+                raise CaptchaSolvingFailed(
+                    captcha_type=CaptchaType.SLIDER_CAPTCHA,
+                    reason=error_text,
+                )
+        else:
+            raise CaptchaSolvingFailed(
+                captcha_type=CaptchaType.SLIDER_CAPTCHA,
+                reason="Invalid response format",
+            )
+
+    except CaptchaSolvingFailed:
+        raise
+    except Exception as e:
+        LOG.error("Error submitting Slider CAPTCHA", error=str(e))
+        raise CaptchaSolvingFailed(
+            captcha_type=CaptchaType.SLIDER_CAPTCHA,
+            reason=str(e),
+        )
+
+
 async def get_solution(captcha_id: str, captcha_type: CaptchaType) -> dict[str, Any] | None:
     """
     Poll for CAPTCHA solution from 2Captcha.
@@ -332,7 +480,7 @@ async def get_solution(captcha_id: str, captcha_type: CaptchaType) -> dict[str, 
         captcha_type: Type of CAPTCHA for logging
 
     Returns:
-        dict with 'token' if solution is ready, None if not ready yet
+        dict with 'token' or 'coordinates' if solution is ready, None if not ready yet
 
     Raises:
         CaptchaSolvingFailed: If 2Captcha returns an error
@@ -356,7 +504,32 @@ async def get_solution(captcha_id: str, captcha_type: CaptchaType) -> dict[str, 
             request_data = response.get("request")
 
             if status == 1:  # Solution is ready
-                LOG.info("CAPTCHA solution ready", captcha_id=captcha_id)
+                LOG.info("CAPTCHA solution ready", captcha_id=captcha_id, response=request_data)
+                
+                # For coordinates captcha, response format is "x1,y1" or "x1,y1;x2,y2"
+                if captcha_type == CaptchaType.SLIDER_CAPTCHA:
+                    # Parse coordinates from response like "coordinates:x=123,y=456"
+                    if isinstance(request_data, str) and "coordinates:" in request_data:
+                        # Format: coordinates:x=123,y=456
+                        coords_str = request_data.replace("coordinates:", "")
+                        coords = {}
+                        for part in coords_str.split(","):
+                            if "=" in part:
+                                key, val = part.split("=")
+                                coords[key.strip()] = int(val.strip())
+                        return {"coordinates": coords}
+                    elif isinstance(request_data, str):
+                        # Try parsing "x,y" format
+                        parts = request_data.split(",")
+                        if len(parts) >= 2:
+                            try:
+                                x = int(parts[0].strip())
+                                y = int(parts[1].strip())
+                                return {"coordinates": {"x": x, "y": y}}
+                            except ValueError:
+                                pass
+                    return {"coordinates": request_data}
+                
                 return {"token": request_data}
             elif request_data == "CAPCHA_NOT_READY":
                 # Solution not ready yet, continue polling
@@ -388,7 +561,7 @@ async def poll_captcha_solution(
     captcha_type: CaptchaType,
     timeout: int = 120,
     polling_interval: int = 5,
-) -> str:
+) -> dict[str, Any]:
     """
     Poll 2Captcha for CAPTCHA solution with timeout.
 
@@ -399,7 +572,7 @@ async def poll_captcha_solution(
         polling_interval: Time between polls in seconds
 
     Returns:
-        The solution token
+        The solution dict (token or coordinates)
 
     Raises:
         CaptchaTimeout: If timeout is reached
@@ -423,12 +596,95 @@ async def poll_captcha_solution(
         solution = await get_solution(captcha_id, captcha_type)
 
         if solution:
-            token = solution.get("token")
-            LOG.info("CAPTCHA solved successfully", captcha_id=captcha_id)
-            return token
+            LOG.info("CAPTCHA solved successfully", captcha_id=captcha_id, solution=solution)
+            return solution
 
         # Wait before next poll
         await asyncio.sleep(polling_interval)
+
+
+async def solve_slider_with_drag(
+    page: Page,
+    coordinates: dict[str, int],
+    slider_info: dict | None = None,
+) -> bool:
+    """
+    Solve slider CAPTCHA by dragging the slider to the target position.
+
+    Args:
+        page: Playwright page instance
+        coordinates: Target coordinates from 2Captcha {"x": int, "y": int}
+        slider_info: Optional slider element info
+
+    Returns:
+        True if drag action was performed
+    """
+    LOG.info("Solving slider CAPTCHA with drag action", coordinates=coordinates)
+
+    try:
+        # Find the slider button
+        slider_button = await page.query_selector("#captcha_slide_button, .secsdk-captcha-drag-icon, [class*='slider'][class*='button'], [class*='slide'][class*='btn']")
+        
+        if not slider_button:
+            LOG.error("Could not find slider button")
+            return False
+
+        # Get slider bounding box
+        box = await slider_button.bounding_box()
+        if not box:
+            LOG.error("Could not get slider bounding box")
+            return False
+
+        # Calculate start position (center of slider button)
+        start_x = box["x"] + box["width"] / 2
+        start_y = box["y"] + box["height"] / 2
+
+        # Calculate end position
+        # The x coordinate from 2Captcha represents the target position
+        target_x = coordinates.get("x", 0)
+        
+        # Calculate the distance to move
+        # Adjust based on the puzzle piece position
+        move_distance = target_x - 20  # Subtract half puzzle piece width (approximate)
+
+        end_x = start_x + move_distance
+        end_y = start_y  # Keep same Y
+
+        LOG.info(
+            "Performing slider drag",
+            start_x=start_x,
+            start_y=start_y,
+            end_x=end_x,
+            end_y=end_y,
+            move_distance=move_distance,
+        )
+
+        # Perform the drag action with human-like movement
+        await page.mouse.move(start_x, start_y)
+        await asyncio.sleep(0.1)
+        await page.mouse.down()
+        await asyncio.sleep(0.05)
+
+        # Move in steps to simulate human movement
+        steps = 20
+        for i in range(1, steps + 1):
+            progress = i / steps
+            current_x = start_x + (end_x - start_x) * progress
+            # Add slight Y variation for realism
+            current_y = start_y + (2 * (0.5 - abs(0.5 - progress)))
+            await page.mouse.move(current_x, current_y)
+            await asyncio.sleep(0.02)
+
+        await page.mouse.move(end_x, end_y)
+        await asyncio.sleep(0.1)
+        await page.mouse.up()
+
+        LOG.info("Slider drag completed")
+        return True
+
+    except Exception as e:
+        LOG.error("Error performing slider drag", error=str(e))
+        return False
 
 
 async def inject_recaptcha_token(page: Page, token: str) -> None:
@@ -524,13 +780,14 @@ async def verify_solution_accepted(page: Page) -> bool:
         # Check if CAPTCHA elements are still present
         recaptcha = await page.query_selector("[data-sitekey]")
         hcaptcha = await page.query_selector(".h-captcha[data-sitekey]")
+        slider = await page.query_selector(".captcha-verify-container, #captcha_slide_button")
 
         # If neither CAPTCHA is present, the solution was likely accepted
-        if not recaptcha and not hcaptcha:
+        if not recaptcha and not hcaptcha and not slider:
             LOG.info("CAPTCHA solution accepted")
             return True
 
-        LOG.info("CAPTCHA still present after injection")
+        LOG.info("CAPTCHA still present after injection/solving")
         return False
 
     except Exception as e:
@@ -552,7 +809,7 @@ async def solve_captcha(
     1. Detects CAPTCHA type and extracts parameters
     2. Submits to 2Captcha API
     3. Polls for solution
-    4. Injects solution into page
+    4. Injects solution into page or performs drag action
     5. Verifies solution was accepted
 
     Args:
@@ -596,6 +853,7 @@ async def solve_captcha(
 
     # Step 2: Submit to 2Captcha
     start_time = datetime.utcnow()
+    token = ""
 
     try:
         if captcha_type == CaptchaType.RECAPTCHA_V2:
@@ -604,6 +862,15 @@ async def solve_captcha(
             captcha_id = await submit_recaptcha_v3(site_key, page_url)
         elif captcha_type == CaptchaType.HCAPTCHA:
             captcha_id = await submit_hcaptcha(site_key, page_url)
+        elif captcha_type == CaptchaType.SLIDER_CAPTCHA:
+            # For slider captcha, we need to capture screenshot first
+            image_base64 = await capture_slider_screenshot(page)
+            if not image_base64:
+                raise CaptchaSolvingFailed(
+                    captcha_type=captcha_type,
+                    reason="Failed to capture slider CAPTCHA screenshot",
+                )
+            captcha_id = await submit_slider_captcha(image_base64)
         else:
             raise CaptchaSolvingFailed(
                 captcha_type=captcha_type,
@@ -611,7 +878,7 @@ async def solve_captcha(
             )
 
         # Step 3: Poll for solution
-        token = await poll_captcha_solution(
+        solution = await poll_captcha_solution(
             captcha_id=captcha_id,
             captcha_type=captcha_type,
             timeout=timeout,
@@ -621,11 +888,24 @@ async def solve_captcha(
         end_time = datetime.utcnow()
         solving_time = (end_time - start_time).total_seconds()
 
-        # Step 4: Inject solution
+        # Step 4: Apply solution
         if captcha_type in [CaptchaType.RECAPTCHA_V2, CaptchaType.RECAPTCHA_V3]:
+            token = solution.get("token", "")
             await inject_recaptcha_token(page, token)
         elif captcha_type == CaptchaType.HCAPTCHA:
+            token = solution.get("token", "")
             await inject_hcaptcha_token(page, token)
+        elif captcha_type == CaptchaType.SLIDER_CAPTCHA:
+            coordinates = solution.get("coordinates", {})
+            if isinstance(coordinates, dict) and "x" in coordinates:
+                await solve_slider_with_drag(
+                    page,
+                    coordinates,
+                    detection_result.slider_element,
+                )
+                token = f"slider_solved_x={coordinates.get('x')}_y={coordinates.get('y')}"
+            else:
+                token = str(coordinates)
 
         # Step 5: Verify solution (optional, best effort)
         await verify_solution_accepted(page)
