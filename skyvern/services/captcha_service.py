@@ -471,6 +471,85 @@ async def submit_slider_captcha(
         )
 
 
+def parse_coordinates_response(request_data: Any) -> dict[str, int] | None:
+    """
+    Parse coordinates from 2Captcha response.
+    
+    2Captcha can return coordinates in multiple formats:
+    - List of dicts: [{'x': '104', 'y': '115'}]
+    - String: "coordinates:x=123,y=456"
+    - String: "104,115"
+    
+    Args:
+        request_data: The response from 2Captcha
+        
+    Returns:
+        Dict with 'x' and 'y' as integers, or None if parsing fails
+    """
+    LOG.info("Parsing coordinates response", raw_data=request_data, data_type=type(request_data).__name__)
+    
+    try:
+        # Handle list format: [{'x': '104', 'y': '115'}]
+        if isinstance(request_data, list) and len(request_data) > 0:
+            first_coord = request_data[0]
+            if isinstance(first_coord, dict):
+                x = first_coord.get('x')
+                y = first_coord.get('y')
+                if x is not None and y is not None:
+                    # Convert to int (values might be strings)
+                    coords = {"x": int(x), "y": int(y)}
+                    LOG.info("Parsed coordinates from list format", coordinates=coords)
+                    return coords
+        
+        # Handle dict format: {'x': 104, 'y': 115}
+        if isinstance(request_data, dict):
+            x = request_data.get('x')
+            y = request_data.get('y')
+            if x is not None and y is not None:
+                coords = {"x": int(x), "y": int(y)}
+                LOG.info("Parsed coordinates from dict format", coordinates=coords)
+                return coords
+        
+        # Handle string formats
+        if isinstance(request_data, str):
+            # Format: "coordinates:x=123,y=456"
+            if "coordinates:" in request_data:
+                coords_str = request_data.replace("coordinates:", "")
+                coords = {}
+                for part in coords_str.split(","):
+                    if "=" in part:
+                        key, val = part.split("=")
+                        coords[key.strip()] = int(val.strip())
+                if "x" in coords and "y" in coords:
+                    LOG.info("Parsed coordinates from 'coordinates:' format", coordinates=coords)
+                    return coords
+            
+            # Format: "104,115" or "x=104,y=115"
+            if "=" in request_data:
+                coords = {}
+                for part in request_data.split(","):
+                    if "=" in part:
+                        key, val = part.split("=")
+                        coords[key.strip()] = int(val.strip())
+                if "x" in coords and "y" in coords:
+                    LOG.info("Parsed coordinates from key=value format", coordinates=coords)
+                    return coords
+            else:
+                # Simple "x,y" format
+                parts = request_data.split(",")
+                if len(parts) >= 2:
+                    coords = {"x": int(parts[0].strip()), "y": int(parts[1].strip())}
+                    LOG.info("Parsed coordinates from simple format", coordinates=coords)
+                    return coords
+        
+        LOG.warning("Could not parse coordinates", raw_data=request_data)
+        return None
+        
+    except (ValueError, TypeError, KeyError) as e:
+        LOG.error("Error parsing coordinates", error=str(e), raw_data=request_data)
+        return None
+
+
 async def get_solution(captcha_id: str, captcha_type: CaptchaType) -> dict[str, Any] | None:
     """
     Poll for CAPTCHA solution from 2Captcha.
@@ -506,29 +585,15 @@ async def get_solution(captcha_id: str, captcha_type: CaptchaType) -> dict[str, 
             if status == 1:  # Solution is ready
                 LOG.info("CAPTCHA solution ready", captcha_id=captcha_id, response=request_data)
                 
-                # For coordinates captcha, response format is "x1,y1" or "x1,y1;x2,y2"
+                # For coordinates captcha, parse the response
                 if captcha_type == CaptchaType.SLIDER_CAPTCHA:
-                    # Parse coordinates from response like "coordinates:x=123,y=456"
-                    if isinstance(request_data, str) and "coordinates:" in request_data:
-                        # Format: coordinates:x=123,y=456
-                        coords_str = request_data.replace("coordinates:", "")
-                        coords = {}
-                        for part in coords_str.split(","):
-                            if "=" in part:
-                                key, val = part.split("=")
-                                coords[key.strip()] = int(val.strip())
+                    coords = parse_coordinates_response(request_data)
+                    if coords:
                         return {"coordinates": coords}
-                    elif isinstance(request_data, str):
-                        # Try parsing "x,y" format
-                        parts = request_data.split(",")
-                        if len(parts) >= 2:
-                            try:
-                                x = int(parts[0].strip())
-                                y = int(parts[1].strip())
-                                return {"coordinates": {"x": x, "y": y}}
-                            except ValueError:
-                                pass
-                    return {"coordinates": request_data}
+                    else:
+                        # Return raw data as fallback
+                        LOG.warning("Using raw coordinates data", raw_data=request_data)
+                        return {"coordinates": request_data}
                 
                 return {"token": request_data}
             elif request_data == "CAPCHA_NOT_READY":
@@ -640,12 +705,16 @@ async def solve_slider_with_drag(
         start_y = box["y"] + box["height"] / 2
 
         # Calculate end position
-        # The x coordinate from 2Captcha represents the target position
+        # The x coordinate from 2Captcha represents where on the image the puzzle piece should go
+        # We need to calculate how far to drag the slider
         target_x = coordinates.get("x", 0)
         
-        # Calculate the distance to move
-        # Adjust based on the puzzle piece position
-        move_distance = target_x - 20  # Subtract half puzzle piece width (approximate)
+        # The slider starts at position ~32px (half of 64px button width)
+        # The target_x is where on the screenshot the puzzle piece center should be
+        # For TikTok slider, the puzzle piece moves with the slider 1:1
+        # So move_distance = target_x - initial_puzzle_position
+        # The puzzle piece usually starts around 20-30px from left edge
+        move_distance = target_x - 32  # Approximate starting position of puzzle piece
 
         end_x = start_x + move_distance
         end_y = start_y  # Keep same Y
@@ -657,6 +726,7 @@ async def solve_slider_with_drag(
             end_x=end_x,
             end_y=end_y,
             move_distance=move_distance,
+            target_x=target_x,
         )
 
         # Perform the drag action with human-like movement
@@ -680,6 +750,10 @@ async def solve_slider_with_drag(
         await page.mouse.up()
 
         LOG.info("Slider drag completed")
+        
+        # Wait a moment for verification
+        await asyncio.sleep(1)
+        
         return True
 
     except Exception as e:
@@ -897,15 +971,18 @@ async def solve_captcha(
             await inject_hcaptcha_token(page, token)
         elif captcha_type == CaptchaType.SLIDER_CAPTCHA:
             coordinates = solution.get("coordinates", {})
+            LOG.info("Applying slider solution", coordinates=coordinates, coordinates_type=type(coordinates).__name__)
+            
             if isinstance(coordinates, dict) and "x" in coordinates:
-                await solve_slider_with_drag(
+                drag_success = await solve_slider_with_drag(
                     page,
                     coordinates,
                     detection_result.slider_element,
                 )
-                token = f"slider_solved_x={coordinates.get('x')}_y={coordinates.get('y')}"
+                token = f"slider_solved_x={coordinates.get('x')}_y={coordinates.get('y')}_success={drag_success}"
             else:
-                token = str(coordinates)
+                LOG.warning("Invalid coordinates format, skipping drag", coordinates=coordinates)
+                token = f"slider_invalid_coords_{coordinates}"
 
         # Step 5: Verify solution (optional, best effort)
         await verify_solution_accepted(page)
