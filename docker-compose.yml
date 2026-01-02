@@ -23,7 +23,7 @@ services:
       dockerfile: Dockerfile
     restart: on-failure
     ports:
-      - "8000:8000"
+      - "8001:8000"
       - "9222:9222"
     volumes:
       - ./artifacts:/data/artifacts
