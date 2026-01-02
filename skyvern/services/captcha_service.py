@@ -337,16 +337,12 @@ async def get_solution(captcha_id: str, captcha_type: CaptchaType) -> dict[str, 
     Raises:
         CaptchaSolvingFailed: If 2Captcha returns an error
     """
-    params = {
-        "key": settings.TWOCAPTCHA_API_KEY,
-        "action": "get",
-        "id": captcha_id,
-        "json": 1,
-    }
+    # Build URL with query parameters directly (aiohttp_request doesn't support params=)
+    url = f"{TWOCAPTCHA_RES_URL}?key={settings.TWOCAPTCHA_API_KEY}&action=get&id={captcha_id}&json=1"
 
     try:
         status_code, headers, response = await aiohttp_request(
-            "GET", TWOCAPTCHA_RES_URL, params=params
+            "GET", url
         )
 
         if status_code != 200:
