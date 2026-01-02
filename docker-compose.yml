@@ -25,6 +25,7 @@ services:
     ports:
       - "8001:8000"
       - "9222:9222"
+      - "6080:6080"
     volumes:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
@@ -44,6 +45,10 @@ services:
       - CAPTCHA_MAX_RETRIES=3
       - LOG_LEVEL=INFO
       - SKYVERN_TELEMETRY=false
+      - ENABLE_STREAMING=true
+      - ENABLE_VNC=true
+      - VNC_WS_HOST=0.0.0.0
+      - VNC_WS_PORT=6080
     depends_on:
       postgres:
         condition: service_healthy
