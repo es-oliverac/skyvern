@@ -14,6 +14,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - skyvern-network
 
   skyvern:
     build:
@@ -50,6 +52,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - skyvern-network
 
   skyvern-ui:
     image: public.ecr.aws/skyvern/skyvern-ui:latest
@@ -69,6 +73,12 @@ services:
     depends_on:
       skyvern:
         condition: service_healthy
+    networks:
+      - skyvern-network
+
+networks:
+  skyvern-network:
+    driver: bridge
 
 volumes:
   postgres_data:
